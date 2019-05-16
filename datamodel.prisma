@@ -1,0 +1,29 @@
+type Conversation {
+  id: ID! @id
+
+  title: String! @unique
+  startedAt: DateTime! @createdAt
+
+  disabled: Boolean! @default(value: false)
+
+  participants: [User!]!
+  message: [Message!]!
+}
+
+type Message {
+  id: ID! @id
+
+  body: String!
+  createdAt: DateTime! @createdAt
+
+  conversation: Conversation!
+  author: User!
+}
+
+type User {
+  id: ID! @id
+
+  nickname: String! @unique
+
+  conversations: [Conversation]!
+}

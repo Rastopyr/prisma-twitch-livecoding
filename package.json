@@ -11,8 +11,12 @@
     "ts-node": "^8.1.0",
     "typescript": "^3.4.5"
   },
+  "devDependencies": {
+    "nodemon": "^1.19.0"
+  },
+
   "scripts": {
     "prisma:deploy": "prisma deploy",
-    "start": "ts-node index.ts"
+    "start": "nodemon --exec ts-node index.ts"
   }
 }

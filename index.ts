@@ -1,11 +1,11 @@
-import { GraphQLServer } from "graphql-yoga";
+import { GraphQLServer, PubSub } from "graphql-yoga";
 import { sign, verify } from "jsonwebtoken";
 
 import { GraphQLScalarType } from "graphql";
 import { Kind } from "graphql/language";
 
-import { prisma, Conversation } from "./generated/prisma-client/index";
-import { shield, rule } from "graphql-shield";
+import { shield, rule, and } from "graphql-shield";
+import { prisma } from "./generated/prisma-client/index";
 
 const typeDefs = `
   scalar Date
@@ -61,13 +61,18 @@ const typeDefs = `
     sendMessage(body: String!, conversation: ID!): Message!
     joinToConversation(conversation: ID!): Conversation!
   }
+
+  type Subscription {
+    message(conversation: ID!): Message!
+  }
 `;
 
 const getUser = async (req) => {
   const authorization = req.get("Authorization");
 
   if (!authorization) {
-    throw new Error(`Not authenticated`);
+    // throw new Error(`Not authenticated`);
+    return null;
   }
 
   const token = authorization.replace("Bearer ", "");
@@ -76,14 +81,30 @@ const getUser = async (req) => {
   const meIsExists = await prisma.$exists.user({ id });
 
   if (!meIsExists) {
-    throw new Error(`User not exists`);
+    // throw new Error(`User not exists`);
+    return null;
   }
 
   return await prisma.user({ id });
 };
 
-const isAuthenticated = rule()(async (parent, args, ctx, info) => {
-  return ctx.user !== null;
+const existsUserInConv = async ({ userId, conversationId, prisma }) => {
+  const participants = await prisma
+    .conversation({ id: conversationId })
+    .participants();
+
+  return participants.some(({ id }) => userId === id);
+};
+
+const isAuthenticated = rule()(async (parent, args, ctx) => {
+  return ctx.user != null;
+});
+
+const haveUserAccessToConv = rule()(async (parent, args, ctx) => {
+  const { conversation: conversationId } = args;
+  const { user, prisma } = ctx;
+
+  return await existsUserInConv({ prisma, userId: user.id, conversationId });
 });
 
 const permissions = shield({
@@ -92,8 +113,12 @@ const permissions = shield({
   },
 
   Mutation: {
-    sendMessage: isAuthenticated,
+    sendMessage: and(isAuthenticated, haveUserAccessToConv),
     joinToConversation: isAuthenticated
+  },
+
+  Subscription: {
+    message: and(isAuthenticated, haveUserAccessToConv)
   },
 
   User: {
@@ -110,16 +135,21 @@ const resolvers = {
   },
 
   Mutation: {
-    async joinToConversation(_, { conversation }, { user }, info) {
-      const participants = await prisma
-        .conversation({ id: conversation })
-        .participants();
-      const existedInConv = participants.find(({ id }) => user.id);
+    async joinToConversation(
+      _,
+      { conversation: conversationId },
+      { user, prisma }
+    ) {
+      const isExistsInConv = existsUserInConv({
+        conversationId,
+        userId: user.id,
+        prisma
+      });
 
-      if (!existedInConv) {
+      if (!isExistsInConv) {
         return await prisma.updateConversation({
           where: {
-            id: conversation
+            id: conversationId
           },
 
           data: {
@@ -132,10 +162,10 @@ const resolvers = {
         });
       }
 
-      return;
+      return await prisma.conversation({ id: conversationId });
     },
 
-    async sendMessage(_, { conversation, body }, { user }, info) {
+    async sendMessage(_, { conversation, body }, { user }) {
       const message = await prisma.createMessage({
         author: {
           connect: {
@@ -145,12 +175,14 @@ const resolvers = {
 
         conversation: {
           connect: {
-            id: conversation.id
+            id: conversation
           }
         },
 
         body
       });
+
+      pubsub.publish(conversation, { message });
 
       return message;
     },
@@ -181,6 +213,14 @@ const resolvers = {
     }
   },
 
+  Subscription: {
+    message: {
+      async subscribe(_, { conversation: conversationId }, { user, pubsub }) {
+        return pubsub.asyncIterator(conversationId);
+      }
+    }
+  },
+
   Date: new GraphQLScalarType({
     name: "Date",
     description: "Date custom scalar type",
@@ -188,6 +228,10 @@ const resolvers = {
       return new Date(value); // value from the client
     },
     serialize(value) {
+      if (typeof value === "string") {
+        return value;
+      }
+
       return value.getTime(); // value sent to the client
     },
     parseLiteral(ast) {
@@ -218,14 +262,37 @@ const resolvers = {
         }
       });
     }
-  }
+  },
+
+  Message: {}
 };
 
+const pubsub = new PubSub();
 const server = new GraphQLServer({
   typeDefs,
   resolvers,
   middlewares: [permissions],
-  context: ({ request }) => ({ request, user: getUser(request) })
+  context: async ({ request, connection }) => {
+    if (connection) {
+      return {
+        request,
+        user: await getUser({
+          get(headerName) {
+            return connection.context[headerName];
+          }
+        }),
+        prisma,
+        pubsub
+      };
+    }
+
+    return {
+      request,
+      user: await getUser(request),
+      prisma,
+      pubsub
+    };
+  }
 });
 
 server.start(() => console.log("Server is running on localhost:4000"));
